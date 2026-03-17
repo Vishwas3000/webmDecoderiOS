@@ -11,9 +11,16 @@ enum EBMLID: UInt32 {
     case trackNumber     = 0xD7
     case trackType       = 0x83
     case codecID         = 0x86
+    case codecPrivate    = 0x63A2
+    // Video
     case video           = 0xE0
     case pixelWidth      = 0xB0
     case pixelHeight     = 0xBA
+    // Audio
+    case audio           = 0xE1
+    case samplingFreq    = 0xB5
+    case channels        = 0x9F
+    case bitDepth        = 0x6264
     // Cluster
     case cluster         = 0x1F43B675
     case timecode        = 0xE7          // cluster timestamp (ms)

@@ -3,33 +3,33 @@ import Metal
 import MetalKit
 import CoreMedia
 
-// MARK: - VP9AlphaPlayerView
+// MARK: - VP9AlphaPlayerView (Optimized)
 
-/// A UIView subclass that:
-///   1. Demuxes a VP9+alpha WebM file
-///   2. Decodes each frame pair using libvpx software VP9 decoder (color + alpha)
-///   3. Composites them with a Metal shader
-///   4. Displays the result via MTKView at the source frame rate
+/// Decodes VP9+alpha WebM and composites with Metal.
+///
+/// Optimizations over the original:
+///   1. GPU-side YUV→RGB — raw Y/U/V planes uploaded as R8 textures,
+///      conversion happens in the fragment shader. Eliminates CPU i420→BGRA loop.
+///   2. Parallel decode — color and alpha decoded concurrently on separate threads.
+///   3. Zero-copy demux — frame data sliced from mmap'd file, no heap copies.
+///   4. Alpha Y-only — only the luma plane is uploaded for alpha (skip U/V).
+///   5. Pre-allocated textures — no per-frame allocation, textures reused.
+///   6. No CVPixelBuffer / CVMetalTextureCache overhead.
 final class VP9AlphaPlayerView: UIView {
 
     // MARK: Public
 
     var isLooping = true
     var onPlaybackEnd: (() -> Void)?
-    /// Called after load() finishes — `true` if decoders initialised, `false` if VP9 unavailable.
     var onDecoderReady: ((Bool) -> Void)?
-    private var drawCount = 0
+
     // MARK: Private — Metal
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var renderPipeline: MTLRenderPipelineState?
     private var metalView: MTKView!
-
-    // Textures uploaded each frame
-    private var colorTexture: MTLTexture?
-    private var alphaTexture: MTLTexture?
-    private let textureCache: CVMetalTextureCache
+    private var drawCount = 0
 
     // MARK: Private — Playback
 
@@ -42,12 +42,25 @@ final class VP9AlphaPlayerView: UIView {
     private var frameIndex: Int = 0
     private var isPlaying = false
 
-    // Background decode queue — keeps UI thread free
+    // Audio
+    private var audioPlayer: AudioPlayer?
+    private var audioPacketIndex: Int = 0
+    private static let audioPreBufferCount = 10  // packets to pre-buffer before play
+
+    // Single coordination queue — parallel decode uses global concurrent queues
     private let decodeQueue = DispatchQueue(label: "vp9.decode", qos: .userInteractive)
 
-    // Double-buffer: decoded textures ready for the next render pass
-    private var nextColorTexture: MTLTexture?
-    private var nextAlphaTexture: MTLTexture?
+    // Double-buffer: decoded YUV textures ready for next render pass
+    // Color: Y + U + V (3 textures)    Alpha: Y only (1 texture)
+    private var colorYTex: MTLTexture?
+    private var colorUTex: MTLTexture?
+    private var colorVTex: MTLTexture?
+    private var alphaYTex: MTLTexture?
+
+    private var nextColorY: MTLTexture?
+    private var nextColorU: MTLTexture?
+    private var nextColorV: MTLTexture?
+    private var nextAlphaY: MTLTexture?
     private let textureLock = NSLock()
 
     // MARK: - Init
@@ -60,10 +73,6 @@ final class VP9AlphaPlayerView: UIView {
         device       = dev
         commandQueue = cq
 
-        var cache: CVMetalTextureCache?
-        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, dev, nil, &cache)
-        textureCache = cache!
-
         super.init(frame: frame)
         backgroundColor = .clear
         setupMetalView()
@@ -75,10 +84,6 @@ final class VP9AlphaPlayerView: UIView {
               let cq  = dev.makeCommandQueue() else { return nil }
         device       = dev
         commandQueue = cq
-
-        var cache: CVMetalTextureCache?
-        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, dev, nil, &cache)
-        textureCache = cache!
 
         super.init(coder: coder)
         backgroundColor = .clear
@@ -94,7 +99,7 @@ final class VP9AlphaPlayerView: UIView {
         metalView.delegate            = self
         metalView.framebufferOnly     = false
         metalView.colorPixelFormat    = .bgra8Unorm
-        metalView.isPaused            = true       // we drive via CADisplayLink
+        metalView.isPaused            = true
         metalView.enableSetNeedsDisplay = false
         metalView.isOpaque            = false
         metalView.layer.isOpaque      = false
@@ -103,17 +108,12 @@ final class VP9AlphaPlayerView: UIView {
 
     private func buildRenderPipeline() {
         guard let lib = device.makeDefaultLibrary() else {
-            print("❌ [Metal] makeDefaultLibrary failed — Metal shader not compiled into bundle")
+            print("❌ [Metal] makeDefaultLibrary failed")
             return
         }
-        print("✅ [Metal] library loaded, functions: \(lib.functionNames)")
-
-        guard let vertFn = lib.makeFunction(name: "compositor_vertex") else {
-            print("❌ [Metal] compositor_vertex not found in library")
-            return
-        }
-        guard let fragFn = lib.makeFunction(name: "compositor_fragment") else {
-            print("❌ [Metal] compositor_fragment not found in library")
+        guard let vertFn = lib.makeFunction(name: "compositor_vertex"),
+              let fragFn = lib.makeFunction(name: "compositor_fragment") else {
+            print("❌ [Metal] shader functions not found")
             return
         }
 
@@ -131,7 +131,7 @@ final class VP9AlphaPlayerView: UIView {
 
         do {
             renderPipeline = try device.makeRenderPipelineState(descriptor: desc)
-            print("✅ [Metal] render pipeline created")
+            print("✅ [Metal] render pipeline created (YUV→RGB GPU path)")
         } catch {
             print("❌ [Metal] pipeline creation failed: \(error)")
         }
@@ -140,38 +140,48 @@ final class VP9AlphaPlayerView: UIView {
     // MARK: - Load & Play
 
     func load(fileURL: URL) {
-        print("📂 [Demux] loading \(fileURL.lastPathComponent)")
+        print("[Demux] loading \(fileURL.lastPathComponent)")
         guard let demux = WebMDemuxer(fileURL: fileURL) else {
-            print("❌ [Demux] WebMDemuxer returned nil — parse failed or 0 frames")
+            print("❌ [Demux] parse failed or 0 frames")
             return
         }
         print("✅ [Demux] \(demux.frames.count) frames, \(demux.width)×\(demux.height)")
-
-        let withAlpha = demux.frames.filter { $0.alphaData != nil }.count
-        print("   [Demux] frames with alpha data: \(withAlpha)/\(demux.frames.count)")
-
         demuxer = demux
 
-        colorDecoder = LibVPXDecoder(width: demux.width, height: demux.height)
-        if colorDecoder == nil { print("❌ [libvpx] color decoder init failed") }
-        else                   { print("✅ [libvpx] color decoder ready") }
+        // Both decoders get the Metal device for direct texture upload
+        colorDecoder = LibVPXDecoder(width: demux.width, height: demux.height, device: device)
+        alphaDecoder = LibVPXDecoder(width: demux.width, height: demux.height, device: device)
 
-        alphaDecoder = LibVPXDecoder(width: demux.width, height: demux.height)
-        if alphaDecoder == nil { print("❌ [libvpx] alpha decoder init failed") }
-        else                   { print("✅ [libvpx] alpha decoder ready") }
+        let ready = colorDecoder != nil && alphaDecoder != nil
+        onDecoderReady?(ready)
+        guard ready else { return }
 
-        let decodersReady = colorDecoder != nil && alphaDecoder != nil
-        onDecoderReady?(decodersReady)
-        guard decodersReady else { return }
+        // Setup audio if the file has an audio track
+        if demux.hasAudio, let config = demux.audioConfig {
+            audioPlayer = AudioPlayer(config: config)
+            print("✅ [Player] Audio track detected: \(config.codecID) — \(demux.audioPackets.count) packets")
+        } else {
+            print("ℹ️ [Player] No audio track in this file (video-only)")
+        }
 
-        // Pre-decode first frame so display is immediate on play()
+        // Pre-decode first frame
         decodeQueue.async { self.decodeAndBuffer(index: 0) }
     }
 
     func play() {
-        guard demuxer != nil, !isPlaying else { return }
+        guard let demux = demuxer, !isPlaying else { return }
         isPlaying  = true
         frameIndex = 0
+        audioPacketIndex = 0
+
+        // Pre-buffer audio packets before starting playback
+        if let audio = audioPlayer, demux.hasAudio {
+            let preBuffer = Array(demux.audioPackets.prefix(Self.audioPreBufferCount))
+            audio.schedulePackets(packets: preBuffer, demuxer: demux)
+            audioPacketIndex = preBuffer.count
+            audio.start()
+        }
+
         startTime  = CACurrentMediaTime()
         displayLink = CADisplayLink(target: self, selector: #selector(displayLinkFired))
         displayLink?.preferredFrameRateRange = .init(minimum: 30, maximum: 30, preferred: 30)
@@ -182,6 +192,7 @@ final class VP9AlphaPlayerView: UIView {
         isPlaying = false
         displayLink?.invalidate()
         displayLink = nil
+        audioPlayer?.stop()
     }
 
     // MARK: - Display link
@@ -189,14 +200,23 @@ final class VP9AlphaPlayerView: UIView {
     @objc private func displayLinkFired(_ link: CADisplayLink) {
         guard let frames = demuxer?.frames, !frames.isEmpty else { return }
 
-        let elapsed  = CACurrentMediaTime() - startTime
+        let elapsed   = CACurrentMediaTime() - startTime
         let fps: Double = 30
         let targetIdx = Int(elapsed * fps)
 
         if targetIdx >= frames.count {
             if isLooping {
-                startTime = CACurrentMediaTime()
+                startTime  = CACurrentMediaTime()
                 frameIndex = 0
+                // Reset audio for loop
+                audioPlayer?.stop()
+                audioPacketIndex = 0
+                if let demux = demuxer, let audio = audioPlayer, demux.hasAudio {
+                    let preBuffer = Array(demux.audioPackets.prefix(Self.audioPreBufferCount))
+                    audio.schedulePackets(packets: preBuffer, demuxer: demux)
+                    audioPacketIndex = preBuffer.count
+                    audio.start()
+                }
             } else {
                 stop()
                 onPlaybackEnd?()
@@ -206,96 +226,94 @@ final class VP9AlphaPlayerView: UIView {
 
         let idx = min(targetIdx, frames.count - 1)
         guard idx != frameIndex || frameIndex == 0 else {
-            metalView.draw()    // redraw with existing textures
+            metalView.draw()
             return
         }
         frameIndex = idx
 
-        // Decode next frame on background queue
+        // Feed audio packets up to the current video PTS
+        feedAudioUpTo(elapsed: elapsed)
+
+        // Kick off next frame decode on background queue
         let nextIdx = (idx + 1) % frames.count
         decodeQueue.async { self.decodeAndBuffer(index: nextIdx) }
 
-        // Swap in the buffered textures and draw
+        // Swap buffered textures → current
         textureLock.lock()
-        colorTexture = nextColorTexture
-        alphaTexture = nextAlphaTexture
+        colorYTex = nextColorY
+        colorUTex = nextColorU
+        colorVTex = nextColorV
+        alphaYTex = nextAlphaY
         textureLock.unlock()
 
         metalView.draw()
     }
 
-    // MARK: - Decode
+    // MARK: - Audio feeding
+
+    private func feedAudioUpTo(elapsed: TimeInterval) {
+        guard let demux = demuxer, let audio = audioPlayer, demux.hasAudio else { return }
+
+        let packets = demux.audioPackets
+        // Schedule audio packets whose PTS <= current elapsed time + small lookahead
+        let lookahead = elapsed + 0.1  // 100ms lookahead to avoid underruns
+        while audioPacketIndex < packets.count {
+            let pkt = packets[audioPacketIndex]
+            let pktTime = CMTimeGetSeconds(pkt.pts)
+            guard pktTime <= lookahead else { break }
+            let data = demux.audioData(for: pkt)
+            audio.schedulePacket(data: data)
+            audioPacketIndex += 1
+        }
+    }
+
+    // MARK: - Decode (parallel color + alpha)
 
     private func decodeAndBuffer(index: Int) {
-        guard let frames = demuxer?.frames,
+        guard let demux = demuxer,
               let cd = colorDecoder,
               let ad = alphaDecoder,
-              index < frames.count else {
-            print("⚠️ [Decode] guard failed at index \(index) — demuxer:\(demuxer != nil) cd:\(colorDecoder != nil) ad:\(alphaDecoder != nil)")
+              index < demux.frames.count else { return }
+
+        let frame = demux.frames[index]
+        let colorData = demux.colorData(for: frame)
+        let alphaData = demux.alphaData(for: frame)
+
+        var colorResult: YUVFrame?
+        var alphaResult: AlphaFrame?
+
+        if let aData = alphaData {
+            // Parallel: color + alpha on global concurrent queues
+            let group = DispatchGroup()
+
+            group.enter()
+            DispatchQueue.global(qos: .userInteractive).async {
+                colorResult = cd.decodeYUV(data: colorData)
+                group.leave()
+            }
+
+            group.enter()
+            DispatchQueue.global(qos: .userInteractive).async {
+                alphaResult = ad.decodeAlpha(data: aData)
+                group.leave()
+            }
+
+            group.wait()
+        } else {
+            colorResult = cd.decodeYUV(data: colorData)
+        }
+
+        guard let color = colorResult else {
+            print("❌ [Decode] color decode nil at frame \(index)")
             return
         }
 
-        let frame = frames[index]
-
-        let colorBuf = cd.decode(data: frame.colorData,
-                                 pts: frame.pts,
-                                 isKeyframe: frame.isKeyframe)
-        if colorBuf == nil {
-            print("❌ [Decode] color decode returned nil at frame \(index) (keyframe=\(frame.isKeyframe), \(frame.colorData.count) bytes)")
-        }
-
-        let alphaBuf: CVPixelBuffer?
-        if let aData = frame.alphaData {
-            alphaBuf = ad.decode(data: aData,
-                                  pts: frame.pts,
-                                  isKeyframe: frame.isKeyframe)
-            if alphaBuf == nil {
-                print("❌ [Decode] alpha decode returned nil at frame \(index) (\(aData.count) bytes)")
-            }
-        } else {
-            if index == 0 { print("⚠️ [Decode] frame 0 has no alpha data") }
-            alphaBuf = nil
-        }
-
-        guard let colorPB = colorBuf else { return }
-
-        let colorTex = makeTexture(from: colorPB)
-        let alphaTex = alphaBuf.flatMap { makeTexture(from: $0) }
-
-        if index == 0 {
-            print("🖼 [Texture] frame 0 — color:\(colorTex != nil ? "✅" : "❌")  alpha:\(alphaTex != nil ? "✅" : "⚠️ nil (opaque fallback)")")
-        }
-
         textureLock.lock()
-        nextColorTexture = colorTex
-        nextAlphaTexture = alphaTex
+        nextColorY = color.yTexture
+        nextColorU = color.uTexture
+        nextColorV = color.vTexture
+        nextAlphaY = alphaResult?.yTexture
         textureLock.unlock()
-    }
-
-    // MARK: - CVPixelBuffer → MTLTexture
-
-    private func makeTexture(from pixelBuffer: CVPixelBuffer) -> MTLTexture? {
-        let w = CVPixelBufferGetWidth(pixelBuffer)
-        let h = CVPixelBufferGetHeight(pixelBuffer)
-        let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
-
-        var cvTexture: CVMetalTexture?
-        let status = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault,
-            textureCache,
-            pixelBuffer,
-            nil,
-            .bgra8Unorm,
-            w, h,
-            0,
-            &cvTexture
-        )
-        guard status == kCVReturnSuccess, let cvt = cvTexture else {
-            let fmtStr = String(format: "0x%08X", fmt)
-            print("❌ [Texture] CVMetalTextureCacheCreateTextureFromImage failed status=\(status) fmt=\(fmtStr) \(w)×\(h)")
-            return nil
-        }
-        return CVMetalTextureGetTexture(cvt)
     }
 }
 
@@ -305,28 +323,21 @@ extension VP9AlphaPlayerView: MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
-    // Throttle draw-call noise: only print the first draw and failures
-
-
     func draw(in view: MTKView) {
         drawCount += 1
-        guard let pipeline = renderPipeline else {
-            if drawCount <= 3 { print("❌ [Draw] renderPipeline is nil") }
+        guard let pipeline = renderPipeline,
+              let drawable = view.currentDrawable,
+              let passDesc = view.currentRenderPassDescriptor,
+              let yTex = colorYTex,
+              let uTex = colorUTex,
+              let vTex = colorVTex else {
+            if drawCount <= 3 { print("⚠️ [Draw] waiting for first frame...") }
             return
         }
-        guard let drawable = view.currentDrawable else {
-            if drawCount <= 3 { print("❌ [Draw] no currentDrawable") }
-            return
+
+        if drawCount == 1 {
+            print("✅ [Draw] first frame — Y:\(yTex.width)×\(yTex.height) alpha:\(alphaYTex != nil ? "yes" : "no")")
         }
-        guard let passDesc = view.currentRenderPassDescriptor else {
-            if drawCount <= 3 { print("❌ [Draw] no currentRenderPassDescriptor") }
-            return
-        }
-        guard let colorTex = colorTexture else {
-            if drawCount <= 3 { print("⚠️ [Draw] colorTexture is nil — frame not decoded yet") }
-            return
-        }
-        if drawCount == 1 { print("✅ [Draw] first successful draw, colorTex=\(colorTex.width)×\(colorTex.height) alphaTex=\(alphaTexture != nil ? "✅" : "nil")") }
 
         passDesc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
         passDesc.colorAttachments[0].loadAction  = .clear
@@ -336,11 +347,12 @@ extension VP9AlphaPlayerView: MTKViewDelegate {
               let encoder = cmdBuf.makeRenderCommandEncoder(descriptor: passDesc) else { return }
 
         encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentTexture(colorTex,    index: 0)
-        // Fall back to color texture as alpha if no alpha track (renders opaque)
-        encoder.setFragmentTexture(alphaTexture ?? colorTex, index: 1)
+        encoder.setFragmentTexture(yTex, index: 0)     // color Y
+        encoder.setFragmentTexture(uTex, index: 1)     // color U
+        encoder.setFragmentTexture(vTex, index: 2)     // color V
+        // Alpha Y — fall back to color Y (renders opaque if no alpha track)
+        encoder.setFragmentTexture(alphaYTex ?? yTex, index: 3)
 
-        // Draw fullscreen quad (4 vertices, triangle-strip)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
 

@@ -291,7 +291,10 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = K6FZYUHLAF;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/libvpx/include";
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/libvpx/include",
+					"$(PROJECT_DIR)/libopus/include",
+				);
 				INFOPLIST_FILE = libAlpha/Info.plist;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
@@ -302,9 +305,15 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/libvpx/lib";
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/libvpx/lib",
+					"$(PROJECT_DIR)/libopus/lib",
+				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = "-lvpx";
+				OTHER_LDFLAGS = (
+					"-lvpx",
+					"-lopus",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.flam.libAlpha;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -327,7 +336,10 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = K6FZYUHLAF;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/libvpx/include";
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/libvpx/include",
+					"$(PROJECT_DIR)/libopus/include",
+				);
 				INFOPLIST_FILE = libAlpha/Info.plist;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
@@ -338,9 +350,15 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/libvpx/lib";
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/libvpx/lib",
+					"$(PROJECT_DIR)/libopus/lib",
+				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = "-lvpx";
+				OTHER_LDFLAGS = (
+					"-lvpx",
+					"-lopus",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.flam.libAlpha;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;

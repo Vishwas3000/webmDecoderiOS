@@ -118,6 +118,23 @@ int vpx_bridge_decode(VPXDecoderRef decoder,
     return ctx->last_img ? 0 : -1;
 }
 
+int vpx_bridge_get_yuv_planes(VPXDecoderRef decoder, VPXYUVPlanes *out) {
+    if (!decoder || !out) return -1;
+    VPXContext *ctx = (VPXContext *)decoder;
+    vpx_image_t *img = ctx->last_img;
+    if (!img) return -1;
+
+    out->y        = img->planes[VPX_PLANE_Y];
+    out->u        = img->planes[VPX_PLANE_U];
+    out->v        = img->planes[VPX_PLANE_V];
+    out->y_stride = img->stride[VPX_PLANE_Y];
+    out->u_stride = img->stride[VPX_PLANE_U];
+    out->v_stride = img->stride[VPX_PLANE_V];
+    out->width    = (int)img->d_w;
+    out->height   = (int)img->d_h;
+    return 0;
+}
+
 int vpx_bridge_get_frame_bgra(VPXDecoderRef decoder,
                               uint8_t *bgra_out,
                               int bgra_stride,
@@ -134,7 +151,6 @@ int vpx_bridge_get_frame_bgra(VPXDecoderRef decoder,
     if (out_width)  *out_width  = w;
     if (out_height) *out_height = h;
 
-    // I420: planes[0]=Y, planes[1]=U(Cb), planes[2]=V(Cr)
     i420_to_bgra(
         img->planes[VPX_PLANE_Y], img->stride[VPX_PLANE_Y],
         img->planes[VPX_PLANE_U], img->stride[VPX_PLANE_U],

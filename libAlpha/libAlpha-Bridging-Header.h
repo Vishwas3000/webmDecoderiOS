@@ -6,3 +6,4 @@
 //
 
 #include "VPXBridge.h"
+#include "OpusBridge.h"

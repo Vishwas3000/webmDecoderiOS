@@ -1,127 +1,140 @@
 import Foundation
-import CoreVideo
+import Metal
 import CoreMedia
 
-// MARK: - LibVPX Software VP9 Decoder
+// MARK: - Decoded YUV frame — GPU-ready plane textures
 
-/// Decodes raw VP9 frame data using libvpx via VPXBridge (software decode).
-/// Returns BGRA CVPixelBuffers ready for Metal compositing.
+struct YUVFrame {
+    let yTexture: MTLTexture    // W×H     R8Unorm (luma)
+    let uTexture: MTLTexture    // W/2×H/2 R8Unorm (Cb)
+    let vTexture: MTLTexture    // W/2×H/2 R8Unorm (Cr)
+}
+
+struct AlphaFrame {
+    let yTexture: MTLTexture    // W×H R8Unorm (luma = alpha)
+}
+
+// MARK: - LibVPX Software VP9 Decoder (YUV-direct path)
+
+/// Decodes raw VP9 frame data using libvpx via VPXBridge.
+/// Returns raw YUV planes uploaded directly to Metal textures.
+///
+/// Uses ping-pong texture sets: while the GPU renders set A,
+/// the CPU can write into set B without a race condition.
 final class LibVPXDecoder {
 
     private let handle: VPXDecoderRef
     let width:  Int
     let height: Int
 
-    // Pre-allocated BGRA buffer (avoids malloc per frame)
-    private let bgraBuffer: UnsafeMutablePointer<UInt8>
-    private let bgraStride: Int
-    private let bgraSize: Int
+    // Ping-pong: two sets of Y/U/V textures to avoid write-while-render race
+    private let yTextures: [MTLTexture]   // [0] and [1]
+    private let uTextures: [MTLTexture]
+    private let vTextures: [MTLTexture]
+    private var slot = 0                  // toggles 0 ↔ 1
 
-    // Pixel buffer pool for efficient CVPixelBuffer allocation
-    private var pixelBufferPool: CVPixelBufferPool?
-
-    init?(width: Int, height: Int) {
+    init?(width: Int, height: Int, device: MTLDevice) {
         self.width  = width
         self.height = height
-        self.bgraStride = width * 4
-        self.bgraSize = bgraStride * height
 
-        guard let h = vpx_bridge_create(Int32(width), Int32(height), /* threads */ 2) else {
+        guard let h = vpx_bridge_create(Int32(width), Int32(height), 2) else {
             print("❌ [libvpx] vpx_bridge_create failed for \(width)×\(height)")
             return nil
         }
         self.handle = h
-        self.bgraBuffer = .allocate(capacity: bgraSize)
 
-        // CVPixelBufferPool for zero-copy Metal texture uploads
-        let poolAttrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey  as String: width,
-            kCVPixelBufferHeightKey as String: height,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-        ]
-        CVPixelBufferPoolCreate(kCFAllocatorDefault, nil,
-                                poolAttrs as CFDictionary, &pixelBufferPool)
+        let yDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm, width: width, height: height, mipmapped: false)
+        yDesc.usage = .shaderRead
 
-        print("✅ [libvpx] VP9 software decoder ready (\(width)×\(height))")
+        let uvW = width / 2
+        let uvH = height / 2
+        let uvDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm, width: uvW, height: uvH, mipmapped: false)
+        uvDesc.usage = .shaderRead
+
+        // Allocate 2 sets (ping-pong)
+        var yArr = [MTLTexture](), uArr = [MTLTexture](), vArr = [MTLTexture]()
+        for _ in 0..<2 {
+            guard let y = device.makeTexture(descriptor: yDesc),
+                  let u = device.makeTexture(descriptor: uvDesc),
+                  let v = device.makeTexture(descriptor: uvDesc) else {
+                vpx_bridge_destroy(h)
+                print("❌ [libvpx] MTLTexture allocation failed")
+                return nil
+            }
+            yArr.append(y); uArr.append(u); vArr.append(v)
+        }
+        yTextures = yArr; uTextures = uArr; vTextures = vArr
+
+        print("✅ [libvpx] VP9 decoder ready (\(width)×\(height)) — GPU YUV path")
     }
 
     deinit {
         vpx_bridge_destroy(handle)
-        bgraBuffer.deallocate()
     }
 
-    // MARK: - Public API
+    // MARK: - Decode → YUV textures
 
-    /// Decode one raw VP9 frame and return a BGRA CVPixelBuffer, or nil on error.
-    func decode(data: Data, pts: CMTime, isKeyframe: Bool) -> CVPixelBuffer? {
-
-        // 1. Feed raw VP9 bitstream to libvpx
-        let decodeOK = data.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> Bool in
+    func decodeYUV(data: Data) -> YUVFrame? {
+        let ok = data.withUnsafeBytes { ptr -> Bool in
             guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return false
             }
             return vpx_bridge_decode(handle, base, data.count) == 0
         }
+        guard ok else { return nil }
 
-        guard decodeOK else {
-            if let errStr = vpx_bridge_error(handle) {
-                print("❌ [libvpx] decode error: \(String(cString: errStr))")
-            }
-            return nil
-        }
+        var planes = VPXYUVPlanes()
+        guard vpx_bridge_get_yuv_planes(handle, &planes) == 0 else { return nil }
 
-        // 2. Get decoded BGRA pixels (YUV→BGRA conversion happens in C for speed)
-        var outW: Int32 = 0
-        var outH: Int32 = 0
-        let getOK = vpx_bridge_get_frame_bgra(
-            handle,
-            bgraBuffer,
-            Int32(bgraStride),
-            &outW, &outH
-        )
-        guard getOK == 0 else { return nil }
+        let w = Int(planes.width)
+        let h = Int(planes.height)
+        let s = slot
+        slot ^= 1  // flip for next call
 
-        // 3. Wrap in CVPixelBuffer for Metal
-        return makePixelBuffer(width: Int(outW), height: Int(outH))
+        yTextures[s].replace(region: MTLRegionMake2D(0, 0, w, h),
+                             mipmapLevel: 0,
+                             withBytes: planes.y,
+                             bytesPerRow: Int(planes.y_stride))
+
+        let uvW = w / 2, uvH = h / 2
+        uTextures[s].replace(region: MTLRegionMake2D(0, 0, uvW, uvH),
+                             mipmapLevel: 0,
+                             withBytes: planes.u,
+                             bytesPerRow: Int(planes.u_stride))
+
+        vTextures[s].replace(region: MTLRegionMake2D(0, 0, uvW, uvH),
+                             mipmapLevel: 0,
+                             withBytes: planes.v,
+                             bytesPerRow: Int(planes.v_stride))
+
+        return YUVFrame(yTexture: yTextures[s], uTexture: uTextures[s], vTexture: vTextures[s])
     }
 
-    // MARK: - CVPixelBuffer creation
-
-    private func makePixelBuffer(width w: Int, height h: Int) -> CVPixelBuffer? {
-        var pb: CVPixelBuffer?
-        let status: CVReturn
-        if let pool = pixelBufferPool {
-            status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
-        } else {
-            status = CVPixelBufferCreate(
-                kCFAllocatorDefault, w, h,
-                kCVPixelFormatType_32BGRA,
-                [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
-                &pb
-            )
-        }
-        guard status == kCVReturnSuccess, let pixelBuffer = pb else { return nil }
-
-        CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-
-        guard let dst = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
-        let dstStride = CVPixelBufferGetBytesPerRow(pixelBuffer)
-
-        // Copy BGRA rows from our C-side buffer into the CVPixelBuffer
-        let src = bgraBuffer
-        if dstStride == bgraStride {
-            // Fast path — single memcpy
-            memcpy(dst, src, bgraStride * h)
-        } else {
-            // Row-by-row copy (strides differ due to CVPixelBuffer alignment)
-            let rowBytes = min(bgraStride, dstStride)
-            for row in 0 ..< h {
-                memcpy(dst + row * dstStride, src + row * bgraStride, rowBytes)
+    /// Decode alpha — only uploads Y plane (luma = alpha).
+    func decodeAlpha(data: Data) -> AlphaFrame? {
+        let ok = data.withUnsafeBytes { ptr -> Bool in
+            guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return false
             }
+            return vpx_bridge_decode(handle, base, data.count) == 0
         }
+        guard ok else { return nil }
 
-        return pixelBuffer
+        var planes = VPXYUVPlanes()
+        guard vpx_bridge_get_yuv_planes(handle, &planes) == 0 else { return nil }
+
+        let w = Int(planes.width)
+        let h = Int(planes.height)
+        let s = slot
+        slot ^= 1
+
+        yTextures[s].replace(region: MTLRegionMake2D(0, 0, w, h),
+                             mipmapLevel: 0,
+                             withBytes: planes.y,
+                             bytesPerRow: Int(planes.y_stride))
+
+        return AlphaFrame(yTexture: yTextures[s])
     }
 }

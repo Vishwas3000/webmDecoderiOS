@@ -1,77 +1,114 @@
 import Foundation
 import CoreMedia
 
-// MARK: - Output model
+// MARK: - Output models
 
-/// One frame pair: color VP9 bitstream + optional alpha VP9 bitstream.
+/// One video frame pair: offsets into the mmap'd file for color + optional alpha VP9 data.
 struct VP9FramePair {
-    let pts: CMTime          // presentation timestamp (milliseconds time base)
+    let pts: CMTime
     let isKeyframe: Bool
-    let colorData: Data      // raw VP9 frame — Track 1 (or the main Block)
-    let alphaData: Data?     // raw VP9 frame — BlockAdditional id=1, or nil
+    let colorOffset: Int
+    let colorSize: Int
+    let alphaOffset: Int       // 0 if no alpha
+    let alphaSize: Int         // 0 if no alpha
+
+    var hasAlpha: Bool { alphaSize > 0 }
 }
 
-// MARK: - WebM Demuxer
+/// One audio packet: offset into the mmap'd file.
+struct AudioPacket {
+    let pts: CMTime
+    let offset: Int
+    let size: Int
+}
 
-/// Parses a VP9+alpha WebM/Matroska file and returns all frame pairs.
-/// Alpha is expected in BlockAdditional (BlockAddID=1) inside BlockGroup elements.
+/// Audio track configuration parsed from TrackEntry.
+struct AudioTrackConfig {
+    let trackNumber: UInt64
+    let codecID: String           // "A_OPUS" or "A_VORBIS"
+    let sampleRate: Double
+    let channels: Int
+    let codecPrivateOffset: Int   // OpusHead / Vorbis headers in the file
+    let codecPrivateSize: Int
+}
+
+// MARK: - WebM Demuxer (zero-copy, audio+video)
+
 final class WebMDemuxer {
 
-    // Video dimensions (from the first TrackEntry with type video)
     private(set) var width:  Int = 0
     private(set) var height: Int = 0
-
-    // All parsed frame pairs, ordered by PTS
     private(set) var frames: [VP9FramePair] = []
+
+    // Audio
+    private(set) var audioConfig: AudioTrackConfig?
+    private(set) var audioPackets: [AudioPacket] = []
+
+    // Track number mapping (discovered during Tracks parsing)
+    private var videoTrackNumber: UInt64 = 1
+    private var audioTrackNumber: UInt64 = 0
+
+    private let fileData: Data
 
     init?(fileURL: URL) {
         guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
             return nil
         }
+        fileData = data
         parse(data: data)
         frames.sort { $0.pts < $1.pts }
+        audioPackets.sort { $0.pts < $1.pts }
         guard !frames.isEmpty else { return nil }
+    }
+
+    var hasAudio: Bool { audioConfig != nil && !audioPackets.isEmpty }
+
+    // MARK: - Zero-copy accessors
+
+    func colorData(for frame: VP9FramePair) -> Data {
+        fileData[frame.colorOffset ..< frame.colorOffset + frame.colorSize]
+    }
+
+    func alphaData(for frame: VP9FramePair) -> Data? {
+        guard frame.hasAlpha else { return nil }
+        return fileData[frame.alphaOffset ..< frame.alphaOffset + frame.alphaSize]
+    }
+
+    func audioData(for packet: AudioPacket) -> Data {
+        fileData[packet.offset ..< packet.offset + packet.size]
+    }
+
+    func codecPrivateData() -> Data? {
+        guard let cfg = audioConfig, cfg.codecPrivateSize > 0 else { return nil }
+        return Data(fileData[cfg.codecPrivateOffset ..< cfg.codecPrivateOffset + cfg.codecPrivateSize])
     }
 
     // MARK: - Top-level parse
 
     private func parse(data: Data) {
         let r = EBMLReader(data: data)
-
         while !r.isAtEnd {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
-
             switch id {
             case EBMLID.ebmlHeader.rawValue:
-                r.skip(size ?? 0)           // skip EBML header, we already know it's WebM
-
+                r.skip(size ?? 0)
             case EBMLID.segment.rawValue:
-                // size can be nil (unknown size) — parse children until end of data
                 let segEnd = size.map { r.cursor + $0 } ?? data.count
                 parseSegment(r, end: segEnd)
-
             default:
                 r.skip(size ?? 0)
             }
         }
     }
 
-    // MARK: - Segment children
-
     private func parseSegment(_ r: EBMLReader, end: Int) {
         while r.cursor < end && !r.isAtEnd {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
             let elementEnd = size.map { r.cursor + $0 } ?? end
-
             switch id {
-            case EBMLID.tracks.rawValue:
-                parseTracks(r, end: elementEnd)
-
-            case EBMLID.cluster.rawValue:
-                parseCluster(r, end: elementEnd)
-
-            default:
-                r.seek(to: elementEnd)
+            case EBMLID.tracks.rawValue:  parseTracks(r, end: elementEnd)
+            case EBMLID.cluster.rawValue: parseCluster(r, end: elementEnd)
+            default: r.seek(to: elementEnd)
             }
         }
     }
@@ -82,7 +119,6 @@ final class WebMDemuxer {
         while r.cursor < end {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
             let elementEnd = size.map { r.cursor + $0 } ?? end
-
             if id == EBMLID.trackEntry.rawValue {
                 parseTrackEntry(r, end: elementEnd)
             } else {
@@ -92,9 +128,13 @@ final class WebMDemuxer {
     }
 
     private func parseTrackEntry(_ r: EBMLReader, end: Int) {
+        var trackNum: UInt64 = 0
         var trackType: UInt64 = 0
-        var localWidth = 0
-        var localHeight = 0
+        var codecIDStr = ""
+        var localWidth = 0, localHeight = 0
+        var sampleRate: Double = 0
+        var channelCount = 0
+        var cpOffset = 0, cpSize = 0
 
         while r.cursor < end {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
@@ -102,21 +142,37 @@ final class WebMDemuxer {
             let sz = size ?? 0
 
             switch id {
+            case EBMLID.trackNumber.rawValue:
+                trackNum = r.readUInt(bytes: sz) ?? 0
             case EBMLID.trackType.rawValue:
                 trackType = r.readUInt(bytes: sz) ?? 0
-
+            case EBMLID.codecID.rawValue:
+                codecIDStr = r.readString(length: sz) ?? ""
+            case EBMLID.codecPrivate.rawValue:
+                cpOffset = r.cursor
+                cpSize = sz
+                r.skip(sz)
             case EBMLID.video.rawValue:
-                parseVideoElement(r, end: elementEnd,
-                                  width: &localWidth, height: &localHeight)
-
+                parseVideoElement(r, end: elementEnd, width: &localWidth, height: &localHeight)
+            case EBMLID.audio.rawValue:
+                parseAudioElement(r, end: elementEnd, sampleRate: &sampleRate, channels: &channelCount)
             default:
                 r.seek(to: elementEnd)
             }
         }
 
         if trackType == 1 && localWidth > 0 && localHeight > 0 {
-            width  = localWidth
-            height = localHeight
+            width = localWidth; height = localHeight
+            videoTrackNumber = trackNum
+        }
+
+        if trackType == 2 && sampleRate > 0 && channelCount > 0 {
+            audioTrackNumber = trackNum
+            audioConfig = AudioTrackConfig(
+                trackNumber: trackNum, codecID: codecIDStr,
+                sampleRate: sampleRate, channels: channelCount,
+                codecPrivateOffset: cpOffset, codecPrivateSize: cpSize)
+            print("[Demux] Audio track #\(trackNum): \(codecIDStr) \(sampleRate)Hz \(channelCount)ch")
         }
     }
 
@@ -126,10 +182,40 @@ final class WebMDemuxer {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
             let sz = size ?? 0
             switch id {
-            case EBMLID.pixelWidth.rawValue:
-                width = Int(r.readUInt(bytes: sz) ?? 0)
-            case EBMLID.pixelHeight.rawValue:
-                height = Int(r.readUInt(bytes: sz) ?? 0)
+            case EBMLID.pixelWidth.rawValue:  width = Int(r.readUInt(bytes: sz) ?? 0)
+            case EBMLID.pixelHeight.rawValue: height = Int(r.readUInt(bytes: sz) ?? 0)
+            default: r.skip(sz)
+            }
+        }
+    }
+
+    private func parseAudioElement(_ r: EBMLReader, end: Int,
+                                   sampleRate: inout Double, channels: inout Int) {
+        while r.cursor < end {
+            guard let id = r.readID(), let size = readElementSize(r) else { break }
+            let sz = size ?? 0
+            switch id {
+            case EBMLID.samplingFreq.rawValue:
+                // EBML float: big-endian IEEE 754 (8 or 4 bytes)
+                if sz == 8, let d = r.readBytes(sz) {
+                    let bits = d.withUnsafeBytes { ptr -> UInt64 in
+                        var v: UInt64 = 0
+                        for byte in ptr { v = (v << 8) | UInt64(byte) }
+                        return v
+                    }
+                    sampleRate = Double(bitPattern: bits)
+                } else if sz == 4, let d = r.readBytes(sz) {
+                    let bits = d.withUnsafeBytes { ptr -> UInt32 in
+                        var v: UInt32 = 0
+                        for byte in ptr { v = (v << 8) | UInt32(byte) }
+                        return v
+                    }
+                    sampleRate = Double(Float(bitPattern: bits))
+                } else {
+                    sampleRate = Double(r.readUInt(bytes: sz) ?? 0)
+                }
+            case EBMLID.channels.rawValue:
+                channels = Int(r.readUInt(bytes: sz) ?? 0)
             default:
                 r.skip(sz)
             }
@@ -151,11 +237,9 @@ final class WebMDemuxer {
                 clusterTimecode = Int64(r.readUInt(bytes: sz) ?? 0)
 
             case EBMLID.simpleBlock.rawValue:
-                if let frame = parseSimpleBlock(r, size: sz, clusterTimecode: clusterTimecode) {
-                    frames.append(frame)
-                } else {
-                    r.seek(to: elementEnd)
-                }
+                let beforeCursor = r.cursor
+                parseSimpleBlockMultiTrack(r, size: sz, clusterTimecode: clusterTimecode)
+                if r.cursor < elementEnd { r.seek(to: elementEnd) }
 
             case EBMLID.blockGroup.rawValue:
                 if let frame = parseBlockGroup(r, end: elementEnd, clusterTimecode: clusterTimecode) {
@@ -170,41 +254,45 @@ final class WebMDemuxer {
         }
     }
 
-    // MARK: - SimpleBlock (no alpha extension support — alpha uses BlockGroup)
+    // MARK: - SimpleBlock (routes to video or audio by track number)
 
-    private func parseSimpleBlock(_ r: EBMLReader, size: Int,
-                                  clusterTimecode: Int64) -> VP9FramePair? {
+    private func parseSimpleBlockMultiTrack(_ r: EBMLReader, size: Int, clusterTimecode: Int64) {
         let start = r.cursor
-        guard size > 4 else { r.skip(size); return nil }
+        guard size > 4 else { r.skip(size); return }
 
-        // Track number VINT
-        guard let _ = r.readID() else { return nil }  // track number as VINT
+        guard let trackNumRaw = r.readID() else { return }
+        let trackNum = UInt64(stripVINTMarker(trackNumRaw))
 
-        // 2-byte signed relative timecode
-        guard let tcBytes = r.readBytes(2) else { return nil }
+        guard let tcBytes = r.readBytes(2) else { return }
         let relTC = Int16(bitPattern: UInt16(tcBytes[0]) << 8 | UInt16(tcBytes[1]))
-
-        // Flags byte
-        guard let flags = r.readByte() else { return nil }
+        guard let flags = r.readByte() else { return }
         let isKeyframe = (flags & 0x80) != 0
 
-        // Remaining bytes = VP9 frame data
         let headerConsumed = r.cursor - start
         let frameSize = size - headerConsumed
-        guard frameSize > 0, let frameData = r.readBytes(frameSize) else { return nil }
+        guard frameSize > 0 else { return }
+
+        let frameOffset = r.cursor
+        r.skip(frameSize)
 
         let ptsMsec = clusterTimecode + Int64(relTC)
         let pts = CMTime(value: ptsMsec, timescale: 1000)
-        return VP9FramePair(pts: pts, isKeyframe: isKeyframe,
-                            colorData: frameData, alphaData: nil)
+
+        if trackNum == audioTrackNumber && audioTrackNumber != 0 {
+            audioPackets.append(AudioPacket(pts: pts, offset: frameOffset, size: frameSize))
+        } else {
+            frames.append(VP9FramePair(pts: pts, isKeyframe: isKeyframe,
+                                       colorOffset: frameOffset, colorSize: frameSize,
+                                       alphaOffset: 0, alphaSize: 0))
+        }
     }
 
-    // MARK: - BlockGroup (carries BlockAdditions for alpha)
+    // MARK: - BlockGroup (video with alpha)
 
     private func parseBlockGroup(_ r: EBMLReader, end: Int,
                                  clusterTimecode: Int64) -> VP9FramePair? {
-        var colorData: Data?
-        var alphaData: Data?
+        var colorOffset = 0, colorSize = 0
+        var alphaOffset = 0, alphaSize = 0
         var pts: CMTime = .zero
         var isKeyframe = false
 
@@ -215,91 +303,84 @@ final class WebMDemuxer {
 
             switch id {
             case EBMLID.block.rawValue:
-                // Parse the main Block (same header layout as SimpleBlock, but no keyframe flag here)
                 let blockStart = r.cursor
                 guard sz > 4 else { r.skip(sz); break }
-
-                guard let _ = r.readID() else { break }    // track number VINT
+                guard let _ = r.readID() else { break }
                 guard let tcBytes = r.readBytes(2) else { break }
                 let relTC = Int16(bitPattern: UInt16(tcBytes[0]) << 8 | UInt16(tcBytes[1]))
                 guard let flags = r.readByte() else { break }
                 isKeyframe = (flags & 0x80) != 0
-
                 let headerConsumed = r.cursor - blockStart
                 let frameSize = sz - headerConsumed
-                if frameSize > 0, let fd = r.readBytes(frameSize) {
-                    colorData = fd
+                if frameSize > 0 {
+                    colorOffset = r.cursor; colorSize = frameSize
+                    r.skip(frameSize)
                 }
                 let ptsMsec = clusterTimecode + Int64(relTC)
                 pts = CMTime(value: ptsMsec, timescale: 1000)
 
             case EBMLID.blockAdditions.rawValue:
-                alphaData = parseBlockAdditions(r, end: elementEnd)
+                let result = parseBlockAdditions(r, end: elementEnd)
+                alphaOffset = result.offset; alphaSize = result.size
 
             default:
                 r.seek(to: elementEnd)
             }
         }
 
-        guard let color = colorData else { return nil }
+        guard colorSize > 0 else { return nil }
         return VP9FramePair(pts: pts, isKeyframe: isKeyframe,
-                            colorData: color, alphaData: alphaData)
+                            colorOffset: colorOffset, colorSize: colorSize,
+                            alphaOffset: alphaOffset, alphaSize: alphaSize)
     }
 
-    // MARK: - BlockAdditions → BlockMore → BlockAdditional (id=1 → alpha)
+    // MARK: - BlockAdditions
 
-    private func parseBlockAdditions(_ r: EBMLReader, end: Int) -> Data? {
+    private func parseBlockAdditions(_ r: EBMLReader, end: Int) -> (offset: Int, size: Int) {
         while r.cursor < end {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
             let elementEnd = size.map { r.cursor + $0 } ?? end
-
             if id == EBMLID.blockMore.rawValue {
-                if let data = parseBlockMore(r, end: elementEnd) {
-                    return data
-                }
-            } else {
-                r.seek(to: elementEnd)
-            }
+                let result = parseBlockMore(r, end: elementEnd)
+                if result.size > 0 { return result }
+            } else { r.seek(to: elementEnd) }
         }
-        return nil
+        return (0, 0)
     }
 
-    private func parseBlockMore(_ r: EBMLReader, end: Int) -> Data? {
+    private func parseBlockMore(_ r: EBMLReader, end: Int) -> (offset: Int, size: Int) {
         var addID: UInt64 = 0
-        var addData: Data?
-
+        var dataOffset = 0, dataSize = 0
         while r.cursor < end {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
             let sz = size ?? 0
             let elementEnd = r.cursor + sz
-
             switch id {
-            case EBMLID.blockAddID.rawValue:
-                addID = r.readUInt(bytes: sz) ?? 0
-            case EBMLID.blockAdditional.rawValue:
-                addData = r.readBytes(sz)
-            default:
-                r.seek(to: elementEnd)
+            case EBMLID.blockAddID.rawValue:      addID = r.readUInt(bytes: sz) ?? 0
+            case EBMLID.blockAdditional.rawValue:  dataOffset = r.cursor; dataSize = sz; r.skip(sz)
+            default: r.seek(to: elementEnd)
             }
         }
-
-        // BlockAddID=1 is the VP9 alpha channel data
-        return addID == 1 ? addData : nil
+        return addID == 1 ? (dataOffset, dataSize) : (0, 0)
     }
 
     // MARK: - Helpers
 
-    /// Reads a size VINT; if size is nil (unknown size), returns nil so callers use the container end.
     private func readElementSize(_ r: EBMLReader) -> Int?? {
-        // Double optional: .some(nil) = unknown size, .none = parse error
         guard r.remaining > 0 else { return .none }
-        let s = r.readSize()   // returns nil for unknown-size sentinel
-        return .some(s)
+        return .some(r.readSize())
+    }
+
+    private func stripVINTMarker(_ raw: UInt32) -> UInt32 {
+        if raw >= 0x80   && raw <= 0xFF       { return raw & 0x7F }
+        if raw >= 0x4000 && raw <= 0x7FFF     { return raw & 0x3FFF }
+        if raw >= 0x200000 && raw <= 0x3FFFFF { return raw & 0x1FFFFF }
+        if raw >= 0x10000000                  { return raw & 0x0FFFFFFF }
+        return raw
     }
 }
 
-// Allow CMTime comparison for sort
-extension CMTime: Comparable {
+extension CMTime: @retroactive Comparable {
     public static func < (lhs: CMTime, rhs: CMTime) -> Bool {
         CMTimeCompare(lhs, rhs) < 0
     }
