@@ -108,6 +108,14 @@ final class AudioPlayer {
         engine?.stop()
     }
 
+    func pause() {
+        playerNode?.pause()
+    }
+
+    func resume() {
+        playerNode?.play()
+    }
+
     /// Decode an Opus packet and schedule it for playback.
     /// Call this for each AudioPacket from the demuxer.
     func schedulePacket(data: Data) {

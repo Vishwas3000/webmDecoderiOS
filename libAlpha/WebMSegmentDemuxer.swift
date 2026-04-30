@@ -1,95 +1,61 @@
 import Foundation
 import CoreMedia
 
-// MARK: - Output models
+// MARK: - Streaming Frame Types
 
-/// One video frame pair: offsets into the mmap'd file for color + optional alpha VP9 data.
-struct VP9FramePair {
+/// A single video frame from a DASH segment — holds Data slices directly (not file offsets).
+struct StreamingFrame {
     let pts: CMTime
     let isKeyframe: Bool
-    let colorOffset: Int
-    let colorSize: Int
-    let alphaOffset: Int       // 0 if no alpha
-    let alphaSize: Int         // 0 if no alpha
-
-    var hasAlpha: Bool { alphaSize > 0 }
+    let colorData: Data
+    let alphaData: Data?       // nil if no alpha
 }
 
-/// One audio packet: offset into the mmap'd file.
-struct AudioPacket {
+/// A single audio packet from a DASH segment.
+struct StreamingAudioPacket {
     let pts: CMTime
-    let offset: Int
-    let size: Int
+    let data: Data
 }
 
-/// Audio track configuration parsed from TrackEntry.
-struct AudioTrackConfig {
-    let trackNumber: UInt64
-    let codecID: String           // "A_OPUS" or "A_VORBIS"
-    let sampleRate: Double
-    let channels: Int
-    let codecPrivateOffset: Int   // OpusHead / Vorbis headers in the file
-    let codecPrivateSize: Int
+/// Parsed frames from one DASH media segment.
+/// Retains the segment's raw Data so that the frame/packet Data slices remain valid.
+final class SegmentFrames {
+    let segmentData: Data
+    let videoFrames: [StreamingFrame]
+    let audioPackets: [StreamingAudioPacket]
+
+    init(segmentData: Data, videoFrames: [StreamingFrame], audioPackets: [StreamingAudioPacket]) {
+        self.segmentData = segmentData
+        self.videoFrames = videoFrames
+        self.audioPackets = audioPackets
+    }
 }
 
-// MARK: - WebM Demuxer (zero-copy, audio+video)
+// MARK: - WebM Segment Demuxer
 
-final class WebMDemuxer {
+/// Parses individual DASH WebM segments (init + media).
+/// Reuses the same EBML parsing approach as WebMDemuxer but works per-segment
+/// instead of on a complete file.
+final class WebMSegmentDemuxer {
 
-    private(set) var width:  Int = 0
+    // Parsed from init segment
+    private(set) var width: Int = 0
     private(set) var height: Int = 0
-    private(set) var frames: [VP9FramePair] = []
-
-    // Audio
     private(set) var audioConfig: AudioTrackConfig?
-    private(set) var audioPackets: [AudioPacket] = []
+    private(set) var videoTrackNumber: UInt64 = 1
+    private(set) var audioTrackNumber: UInt64 = 0
 
-    // Track number mapping (discovered during Tracks parsing)
-    private var videoTrackNumber: UInt64 = 1
-    private var audioTrackNumber: UInt64 = 0
+    private var codecPrivateData: Data?
 
-    /// Cursor for VP9FrameSource.audioPackets(upTo:) — tracks which packets have been returned.
-    var audioPlaybackCursor: Int = 0
+    // MARK: - Init Segment
 
-    private let fileData: Data
-
-    init?(fileURL: URL) {
-        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
-            return nil
-        }
-        fileData = data
-        parse(data: data)
-        frames.sort { $0.pts < $1.pts }
-        audioPackets.sort { $0.pts < $1.pts }
-        guard !frames.isEmpty else { return nil }
-    }
-
-    var hasAudio: Bool { audioConfig != nil && !audioPackets.isEmpty }
-
-    // MARK: - Zero-copy accessors
-
-    func colorData(for frame: VP9FramePair) -> Data {
-        fileData[frame.colorOffset ..< frame.colorOffset + frame.colorSize]
-    }
-
-    func alphaData(for frame: VP9FramePair) -> Data? {
-        guard frame.hasAlpha else { return nil }
-        return fileData[frame.alphaOffset ..< frame.alphaOffset + frame.alphaSize]
-    }
-
-    func audioData(for packet: AudioPacket) -> Data {
-        fileData[packet.offset ..< packet.offset + packet.size]
-    }
-
-    func codecPrivateData() -> Data? {
-        guard let cfg = audioConfig, cfg.codecPrivateSize > 0 else { return nil }
-        return Data(fileData[cfg.codecPrivateOffset ..< cfg.codecPrivateOffset + cfg.codecPrivateSize])
-    }
-
-    // MARK: - Top-level parse
-
-    private func parse(data: Data) {
+    /// Parse the DASH initialization segment.
+    /// Contains EBML header + Segment with Tracks element (no Clusters).
+    /// Returns true if video track was found.
+    @discardableResult
+    func parseInitSegment(data: Data) -> Bool {
         let r = EBMLReader(data: data)
+
         while !r.isAtEnd {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
             switch id {
@@ -97,26 +63,62 @@ final class WebMDemuxer {
                 r.skip(size ?? 0)
             case EBMLID.segment.rawValue:
                 let segEnd = size.map { r.cursor + $0 } ?? data.count
-                parseSegment(r, end: segEnd)
+                parseSegmentInit(r, end: segEnd)
             default:
                 r.skip(size ?? 0)
             }
         }
+
+        return width > 0 && height > 0
     }
 
-    private func parseSegment(_ r: EBMLReader, end: Int) {
+    private func parseSegmentInit(_ r: EBMLReader, end: Int) {
         while r.cursor < end && !r.isAtEnd {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
             let elementEnd = size.map { r.cursor + $0 } ?? end
             switch id {
-            case EBMLID.tracks.rawValue:  parseTracks(r, end: elementEnd)
-            case EBMLID.cluster.rawValue: parseCluster(r, end: elementEnd)
-            default: r.seek(to: elementEnd)
+            case EBMLID.tracks.rawValue:
+                parseTracks(r, end: elementEnd)
+            default:
+                r.seek(to: elementEnd)
             }
         }
     }
 
-    // MARK: - Tracks
+    // MARK: - Media Segment
+
+    /// Parse a DASH media segment (one or more Clusters).
+    /// Returns SegmentFrames containing video frames and audio packets.
+    func parseMediaSegment(data: Data) -> SegmentFrames {
+        let r = EBMLReader(data: data)
+        var videoFrames: [StreamingFrame] = []
+        var audioPackets: [StreamingAudioPacket] = []
+
+        while !r.isAtEnd {
+            guard let id = r.readID(), let size = readElementSize(r) else { break }
+            let elementEnd = size.map { r.cursor + $0 } ?? data.count
+
+            switch id {
+            case EBMLID.cluster.rawValue:
+                parseCluster(r, end: elementEnd, data: data,
+                             videoFrames: &videoFrames, audioPackets: &audioPackets)
+            case EBMLID.segment.rawValue:
+                // Some DASH segments wrap the Cluster in a Segment element
+                continue  // parse children
+            default:
+                r.seek(to: elementEnd)
+            }
+        }
+
+        videoFrames.sort { $0.pts < $1.pts }
+        audioPackets.sort { $0.pts < $1.pts }
+
+        return SegmentFrames(segmentData: data,
+                             videoFrames: videoFrames,
+                             audioPackets: audioPackets)
+    }
+
+    // MARK: - Tracks Parsing (same logic as WebMDemuxer)
 
     private func parseTracks(_ r: EBMLReader, end: Int) {
         while r.cursor < end {
@@ -137,7 +139,7 @@ final class WebMDemuxer {
         var localWidth = 0, localHeight = 0
         var sampleRate: Double = 0
         var channelCount = 0
-        var cpOffset = 0, cpSize = 0
+        var cpData: Data?
 
         while r.cursor < end {
             guard let id = r.readID(), let size = readElementSize(r) else { break }
@@ -152,9 +154,7 @@ final class WebMDemuxer {
             case EBMLID.codecID.rawValue:
                 codecIDStr = r.readString(length: sz) ?? ""
             case EBMLID.codecPrivate.rawValue:
-                cpOffset = r.cursor
-                cpSize = sz
-                r.skip(sz)
+                cpData = r.readBytes(sz).map { Data($0) }
             case EBMLID.video.rawValue:
                 parseVideoElement(r, end: elementEnd, width: &localWidth, height: &localHeight)
             case EBMLID.audio.rawValue:
@@ -171,11 +171,12 @@ final class WebMDemuxer {
 
         if trackType == 2 && sampleRate > 0 && channelCount > 0 {
             audioTrackNumber = trackNum
+            codecPrivateData = cpData
             audioConfig = AudioTrackConfig(
                 trackNumber: trackNum, codecID: codecIDStr,
                 sampleRate: sampleRate, channels: channelCount,
-                codecPrivateOffset: cpOffset, codecPrivateSize: cpSize)
-            print("[Demux] Audio track #\(trackNum): \(codecIDStr) \(sampleRate)Hz \(channelCount)ch")
+                codecPrivateOffset: 0, codecPrivateSize: cpData?.count ?? 0)
+            print("[SegDemux] Audio track #\(trackNum): \(codecIDStr) \(sampleRate)Hz \(channelCount)ch")
         }
     }
 
@@ -199,19 +200,14 @@ final class WebMDemuxer {
             let sz = size ?? 0
             switch id {
             case EBMLID.samplingFreq.rawValue:
-                // EBML float: big-endian IEEE 754 (8 or 4 bytes)
                 if sz == 8, let d = r.readBytes(sz) {
                     let bits = d.withUnsafeBytes { ptr -> UInt64 in
-                        var v: UInt64 = 0
-                        for byte in ptr { v = (v << 8) | UInt64(byte) }
-                        return v
+                        var v: UInt64 = 0; for byte in ptr { v = (v << 8) | UInt64(byte) }; return v
                     }
                     sampleRate = Double(bitPattern: bits)
                 } else if sz == 4, let d = r.readBytes(sz) {
                     let bits = d.withUnsafeBytes { ptr -> UInt32 in
-                        var v: UInt32 = 0
-                        for byte in ptr { v = (v << 8) | UInt32(byte) }
-                        return v
+                        var v: UInt32 = 0; for byte in ptr { v = (v << 8) | UInt32(byte) }; return v
                     }
                     sampleRate = Double(Float(bitPattern: bits))
                 } else {
@@ -225,9 +221,11 @@ final class WebMDemuxer {
         }
     }
 
-    // MARK: - Cluster
+    // MARK: - Cluster Parsing
 
-    private func parseCluster(_ r: EBMLReader, end: Int) {
+    private func parseCluster(_ r: EBMLReader, end: Int, data: Data,
+                              videoFrames: inout [StreamingFrame],
+                              audioPackets: inout [StreamingAudioPacket]) {
         var clusterTimecode: Int64 = 0
 
         while r.cursor < end && !r.isAtEnd {
@@ -240,13 +238,13 @@ final class WebMDemuxer {
                 clusterTimecode = Int64(r.readUInt(bytes: sz) ?? 0)
 
             case EBMLID.simpleBlock.rawValue:
-                let beforeCursor = r.cursor
-                parseSimpleBlockMultiTrack(r, size: sz, clusterTimecode: clusterTimecode)
+                parseSimpleBlock(r, size: sz, clusterTimecode: clusterTimecode,
+                                 data: data, videoFrames: &videoFrames, audioPackets: &audioPackets)
                 if r.cursor < elementEnd { r.seek(to: elementEnd) }
 
             case EBMLID.blockGroup.rawValue:
-                if let frame = parseBlockGroup(r, end: elementEnd, clusterTimecode: clusterTimecode) {
-                    frames.append(frame)
+                if let frame = parseBlockGroup(r, end: elementEnd, clusterTimecode: clusterTimecode, data: data) {
+                    videoFrames.append(frame)
                 } else {
                     r.seek(to: elementEnd)
                 }
@@ -257,9 +255,10 @@ final class WebMDemuxer {
         }
     }
 
-    // MARK: - SimpleBlock (routes to video or audio by track number)
-
-    private func parseSimpleBlockMultiTrack(_ r: EBMLReader, size: Int, clusterTimecode: Int64) {
+    private func parseSimpleBlock(_ r: EBMLReader, size: Int, clusterTimecode: Int64,
+                                  data: Data,
+                                  videoFrames: inout [StreamingFrame],
+                                  audioPackets: inout [StreamingAudioPacket]) {
         let start = r.cursor
         guard size > 4 else { r.skip(size); return }
 
@@ -280,20 +279,18 @@ final class WebMDemuxer {
 
         let ptsMsec = clusterTimecode + Int64(relTC)
         let pts = CMTime(value: ptsMsec, timescale: 1000)
+        let frameData = data[frameOffset ..< frameOffset + frameSize]
 
         if trackNum == audioTrackNumber && audioTrackNumber != 0 {
-            audioPackets.append(AudioPacket(pts: pts, offset: frameOffset, size: frameSize))
+            audioPackets.append(StreamingAudioPacket(pts: pts, data: frameData))
         } else {
-            frames.append(VP9FramePair(pts: pts, isKeyframe: isKeyframe,
-                                       colorOffset: frameOffset, colorSize: frameSize,
-                                       alphaOffset: 0, alphaSize: 0))
+            videoFrames.append(StreamingFrame(pts: pts, isKeyframe: isKeyframe,
+                                              colorData: frameData, alphaData: nil))
         }
     }
 
-    // MARK: - BlockGroup (video with alpha)
-
-    private func parseBlockGroup(_ r: EBMLReader, end: Int,
-                                 clusterTimecode: Int64) -> VP9FramePair? {
+    private func parseBlockGroup(_ r: EBMLReader, end: Int, clusterTimecode: Int64,
+                                 data: Data) -> StreamingFrame? {
         var colorOffset = 0, colorSize = 0
         var alphaOffset = 0, alphaSize = 0
         var pts: CMTime = .zero
@@ -332,9 +329,12 @@ final class WebMDemuxer {
         }
 
         guard colorSize > 0 else { return nil }
-        return VP9FramePair(pts: pts, isKeyframe: isKeyframe,
-                            colorOffset: colorOffset, colorSize: colorSize,
-                            alphaOffset: alphaOffset, alphaSize: alphaSize)
+
+        let colorData = data[colorOffset ..< colorOffset + colorSize]
+        let alphaData = alphaSize > 0 ? data[alphaOffset ..< alphaOffset + alphaSize] : nil
+
+        return StreamingFrame(pts: pts, isKeyframe: isKeyframe,
+                              colorData: colorData, alphaData: alphaData)
     }
 
     // MARK: - BlockAdditions
@@ -380,11 +380,5 @@ final class WebMDemuxer {
         if raw >= 0x200000 && raw <= 0x3FFFFF { return raw & 0x1FFFFF }
         if raw >= 0x10000000                  { return raw & 0x0FFFFFFF }
         return raw
-    }
-}
-
-extension CMTime: @retroactive Comparable {
-    public static func < (lhs: CMTime, rhs: CMTime) -> Bool {
-        CMTimeCompare(lhs, rhs) < 0
     }
 }
